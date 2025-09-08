@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Tuple
 import csv
 
+
 def save_results_csv(
     output_path: str,
     y_true: List[int],
@@ -35,81 +36,108 @@ def save_results_csv(
             assert isinstance(pred_val, float), "Invalid type in y_pred"
             writer.writerow([true_val, pred_val])
 
-parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-group = parser.add_mutually_exclusive_group(required=True)
-group.add_argument('-d','--dir', type=Path, default=None)
-group.add_argument('-f','--file', default=None)
 
-parser.add_argument('-m','--model_path', type=str, default='weights/blur_jpg_prob0.5.pth')
-parser.add_argument('-c','--crop', type=int, default=None, help='by default, do not crop. specify crop size')
-parser.add_argument('--use_cpu', action='store_true', help='uses gpu by default, turn on to use cpu')
-parser.add_argument('-o','--output_csv', type=str, default=None, help='if specified, write results to csv file')
-parser.add_argument('-b','--batch_size', type=int, default=32)
-parser.add_argument('-j','--workers', type=int, default=4, help='number of workers')
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('-d', '--dir', type=Path, default=None)
+    group.add_argument('-f', '--file', default=None)
 
-opt = parser.parse_args()
+    parser.add_argument('-m', '--model_path', type=str, default='weights/blur_jpg_prob0.5.pth')
+    parser.add_argument('-c', '--crop', type=int, default=None, help='by default, do not crop. specify crop size')
+    parser.add_argument('--use_cpu', action='store_true', help='uses gpu by default, turn on to use cpu')
+    parser.add_argument('-o', '--output_csv', type=str, default=None, help='if specified, write results to csv file')
+    parser.add_argument('-b', '--batch_size', type=int, default=32)
+    parser.add_argument('-j', '--workers', type=int, default=4, help='number of workers')
 
-if opt.dir is not None:
-  assert(opt.dir.exists()), 'Directory %s does not exist'%str(opt.dir)
-  assert(opt.dir.is_dir()), '%s is not a directory'%str(opt.dir)
+    return parser.parse_args()
 
 
-model = resnet50(num_classes=1)
-state_dict = torch.load(opt.model_path, map_location='cpu')
-model.load_state_dict(state_dict['model'])
-if(not opt.use_cpu):
-  model.cuda()
-model.eval()
+def load_model(opt: argparse.Namespace) -> torch.nn.Module:
+    model = resnet50(num_classes=1)
+    state_dict = torch.load(opt.model_path, map_location='cpu')
+    model.load_state_dict(state_dict['model'])
+    if not opt.use_cpu:
+        model.cuda()
+    model.eval()
+    return model
 
-# Transform
-trans_init = []
-if(opt.crop is not None):
-  trans_init = [transforms.CenterCrop(opt.crop),]
-  print('Cropping to [%i]'%opt.crop)
-else:
-  print('Not cropping')
-trans = transforms.Compose(trans_init + [
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
 
-if opt.file is not None:
+def build_transform(opt: argparse.Namespace) -> transforms.Compose:
+    trans_init = []
+    if opt.crop is not None:
+        trans_init = [transforms.CenterCrop(opt.crop)]
+        print('Cropping to [%i]' % opt.crop)
+    else:
+        print('Not cropping')
+    trans = transforms.Compose(trans_init + [
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    return trans
 
-  img = trans(Image.open(opt.file).convert('RGB'))
 
-  with torch.no_grad():
-      in_tens = img.unsqueeze(0)
-      if(not opt.use_cpu):
-          in_tens = in_tens.cuda()
-      prob = model(in_tens).sigmoid().item()
+def process_file(opt: argparse.Namespace, model: torch.nn.Module, trans: transforms.Compose) -> None:
+    img = trans(Image.open(opt.file).convert('RGB'))
+    with torch.no_grad():
+        in_tens = img.unsqueeze(0)
+        if not opt.use_cpu:
+            in_tens = in_tens.cuda()
+        prob = model(in_tens).sigmoid().item()
+    print('probability of being synthetic: {:.2f}%'.format(prob * 100))
 
-  print('probability of being synthetic: {:.2f}%'.format(prob * 100))
 
-if opt.dir is not None:
-  dataset = datasets.ImageFolder(opt.dir, transform=trans)
-  
-  data_loader=torch.utils.data.DataLoader(dataset,
-                                            batch_size=opt.batch_size,
-                                            shuffle=False,
-                                            num_workers=opt.workers)
+def process_dir(opt: argparse.Namespace, model: torch.nn.Module, trans: transforms.Compose) -> None:
+    dataset = datasets.ImageFolder(opt.dir, transform=trans)
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=opt.batch_size,
+        shuffle=False,
+        num_workers=opt.workers
+    )
 
-  y_true, y_pred = [], []
-  with torch.no_grad():
-    for data, label in tqdm(data_loader):
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for data, label in tqdm(data_loader):
+            class_names = [dataset.classes[idx] for idx in label.flatten().tolist()]
+            prefixed_names = [f"{opt.dir.name}_{name}" for name in class_names]
+            y_true.extend(prefixed_names)
+            if not opt.use_cpu:
+                data = data.cuda()
+            y_pred.extend(model(data).sigmoid().flatten().tolist())
 
-      # Convert numeric labels to class names
-      class_names = [dataset.classes[idx] for idx in label.flatten().tolist()]
+    if opt.output_csv is not None:
+        # Preserve original structure while ensuring a valid path
+        if opt.crop is not None:
+            out_path = Path(opt.output_csv) / f'{opt.dir.name}_crop{opt.crop}.csv'
+        else:
+            out_path = Path(opt.output_csv) / f'{opt.dir.name}.csv'
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save_results_csv(str(out_path), y_true, y_pred)
+        print(f"Results saved to {opt.output_csv}")
+    else:
+        out_path = opt.dir / f'results_{opt.dir.name}.csv'
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save_results_csv(str(out_path), y_true, y_pred)
 
-      # Prefix each class name with opt.dir.name
-      prefixed_names = [f"{opt.dir.name}_{name}" for name in class_names]
-      y_true.extend(prefixed_names)
-      if(not opt.use_cpu):
-          data = data.cuda()
-      y_pred.extend(model(data).sigmoid().flatten().tolist())
-  
-  if opt.output_csv is not None:
-    save_results_csv(opt.output_csv / f'{opt.dir.name}', y_true, y_pred)
-    print(f"Results saved to {opt.output_csv}")
-  else:
-    save_results_csv(opt.dir / f'results_{opt.dir.name}.csv', y_true, y_pred)
 
+def main() -> None:
+    opt = parse_args()
+
+    if opt.dir is not None:
+        assert opt.dir.exists(), 'Directory %s does not exist' % str(opt.dir)
+        assert opt.dir.is_dir(), '%s is not a directory' % str(opt.dir)
+
+    model = load_model(opt)
+    trans = build_transform(opt)
+
+    if opt.file is not None:
+        process_file(opt, model, trans)
+
+    if opt.dir is not None:
+        process_dir(opt, model, trans)
+
+
+if __name__ == "__main__":
+    main()
